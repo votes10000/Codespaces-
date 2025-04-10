@@ -1,230 +1,145 @@
 require("dotenv").config();
 const express = require("express");
-const { createClient } = require("@supabase/supabase-js");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
-const jwtSecret = process.env.JWT_SECRET || "your-secret-jwt-key";
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const jwtSecret = process.env.JWT_SECRET || "supersecretkey";
 
-const supabase = createClient(supabaseUrl, supabaseAnonKey);
+// Generate JWT
+const generateToken = (userId, isAdmin = false) =>
+  jwt.sign({ id: userId, isAdmin }, jwtSecret, { expiresIn: "2h" });
 
-// Helper function to generate JWT
-const generateToken = (userId, isAdmin = false) => {
-  return jwt.sign({ id: userId, isAdmin }, jwtSecret, { expiresIn: "1h" });
-};
-
-// Middleware to verify JWT
+// Verify JWT middleware
 const verifyToken = (req, res, next) => {
   const token = req.header("Authorization")?.split(" ")[1];
-  if (!token) {
-    return res.status(401).json({ error: "Access denied. No token provided." });
-  }
+  if (!token) return res.status(401).json({ error: "No token provided." });
+
   try {
     const decoded = jwt.verify(token, jwtSecret);
     req.userId = decoded.id;
     req.isAdmin = decoded.isAdmin;
     next();
-  } catch (error) {
-    res.status(400).json({ error: "Invalid token." });
+  } catch {
+    res.status(401).json({ error: "Invalid token." });
   }
 };
 
-// Client Registration
-app.post(
-  "/register",
+// Register
+app.post("/register",
   [
-    body("username").notEmpty().trim().isLength({ min: 3 }),
-    body("email").isEmail().normalizeEmail(),
+    body("username").notEmpty().isLength({ min: 3 }),
+    body("email").isEmail(),
     body("password").isLength({ min: 6 }),
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const { username, email, password } = req.body;
 
-    try {
-      const { data: existingUser, error: checkError } = await supabase
-        .from("users")
-        .select("id")
-        .or(`username.eq.${username},email.eq.${email}`)
-        .single();
+    const { data: existingUser } = await supabase
+      .from("users")
+      .select("id")
+      .or(`username.eq.${username},email.eq.${email}`)
+      .maybeSingle();
 
-      if (checkError && checkError.code !== "PGRST116") {
-        console.error("Error checking existing user:", checkError);
-        return res.status(500).json({ error: "Internal server error." });
-      }
+    if (existingUser) return res.status(409).json({ error: "User already exists." });
 
-      if (existingUser) {
-        return res.status(409).json({ error: "Username or email already exists." });
-      }
+    const password_hash = await bcrypt.hash(password, 10);
 
-      const salt = await bcrypt.genSalt(10);
-      const hashedPassword = await bcrypt.hash(password, salt);
+    const { data: newUser, error } = await supabase
+      .from("users")
+      .insert([{ username, email, password_hash, balance: 0, bonus: 0 }])
+      .select("id, username, email")
+      .single();
 
-      const { data: newUser, error: registerError } = await supabase
-        .from("users")
-        .insert([{ username, email, password_hash: hashedPassword, balance: 0, bonus: 0 }])
-        .select("id, username, email")
-        .single();
+    if (error) return res.status(500).json({ error: "Registration failed." });
 
-      if (registerError) {
-        console.error("Error registering user:", registerError);
-        return res.status(500).json({ error: "Failed to register user." });
-      }
-
-      const token = generateToken(newUser.id);
-      res.status(201).json({ message: "User registered successfully!", user: newUser, token });
-    } catch (error) {
-      console.error("Registration error:", error);
-      res.status(500).json({ error: "Internal server error during registration." });
-    }
+    const token = generateToken(newUser.id);
+    res.json({ user: newUser, token });
   }
 );
 
-// Updated Login Route with Validation
-app.post(
-  "/login",
+// Login
+app.post("/login",
   [
-    body("identifier")
-      .notEmpty()
-      .withMessage("Username or email is required.")
-      .isLength({ min: 3 })
-      .withMessage("Identifier must be at least 3 characters."),
-    body("password")
-      .notEmpty()
-      .withMessage("Password is required.")
-      .isLength({ min: 6 })
-      .withMessage("Password must be at least 6 characters."),
+    body("identifier").notEmpty().isLength({ min: 3 }),
+    body("password").isLength({ min: 6 }),
   ],
   async (req, res) => {
     const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
     const { identifier, password } = req.body;
 
-    try {
-      const { data: user, error: userError } = await supabase
-        .from("users")
-        .select("id, username, email, password_hash, is_admin")
-        .or(`username.eq.${identifier},email.eq.${identifier}`)
-        .single();
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id, username, email, password_hash, is_admin")
+      .or(`username.eq.${identifier},email.eq.${identifier}`)
+      .maybeSingle();
 
-      if (userError) {
-        console.error("Error during login:", userError);
-        return res.status(500).json({ error: "Internal server error." });
-      }
+    if (error || !user) return res.status(401).json({ error: "Invalid credentials." });
 
-      if (!user) {
-        return res.status(401).json({ error: "Invalid credentials." });
-      }
+    const match = await bcrypt.compare(password, user.password_hash);
+    if (!match) return res.status(401).json({ error: "Invalid credentials." });
 
-      const passwordMatch = await bcrypt.compare(password, user.password_hash);
-      if (!passwordMatch) {
-        return res.status(401).json({ error: "Invalid credentials." });
-      }
-
-      const token = generateToken(user.id, user.is_admin || false);
-      res.json({
-        message: "Login successful!",
-        token,
-        user: {
-          id: user.id,
-          username: user.username,
-          email: user.email,
-        },
-      });
-    } catch (error) {
-      console.error("Login error:", error);
-      res.status(500).json({ error: "Internal server error during login." });
-    }
+    const token = generateToken(user.id, user.is_admin);
+    res.json({
+      message: "Login successful",
+      token,
+      user: { id: user.id, username: user.username, email: user.email },
+    });
   }
 );
 
-// Admin-only route to update user balance
+// Admin: Update balance
 app.put("/admin/users/:id/balance", verifyToken, async (req, res) => {
-  if (!req.isAdmin) {
-    return res.status(403).json({ error: "Admin privileges required." });
-  }
+  if (!req.isAdmin) return res.status(403).json({ error: "Admin only." });
 
   const { id } = req.params;
   const { balance } = req.body;
 
-  if (typeof balance !== "number") {
-    return res.status(400).json({ error: "Invalid balance value." });
-  }
+  if (typeof balance !== "number") return res.status(400).json({ error: "Balance must be a number." });
 
-  try {
-    const { data: updatedUser, error: updateError } = await supabase
-      .from("users")
-      .update({ balance })
-      .eq("id", id)
-      .select("id, username, email, balance, bonus")
-      .single();
+  const { data, error } = await supabase
+    .from("users")
+    .update({ balance })
+    .eq("id", id)
+    .select()
+    .single();
 
-    if (updateError) {
-      console.error("Error updating user balance:", updateError);
-      return res.status(500).json({ error: "Failed to update user balance." });
-    }
+  if (error) return res.status(500).json({ error: "Failed to update balance." });
 
-    if (!updatedUser) {
-      return res.status(404).json({ error: "User not found." });
-    }
-
-    res.json({ message: "User balance updated successfully!", user: updatedUser });
-  } catch (error) {
-    console.error("Error updating user balance:", error);
-    res.status(500).json({ error: "Internal server error during balance update." });
-  }
+  res.json({ message: "Balance updated", user: data });
 });
 
-// Admin-only route to update user bonus
+// Admin: Update bonus
 app.put("/admin/users/:id/bonus", verifyToken, async (req, res) => {
-  if (!req.isAdmin) {
-    return res.status(403).json({ error: "Admin privileges required." });
-  }
+  if (!req.isAdmin) return res.status(403).json({ error: "Admin only." });
 
   const { id } = req.params;
   const { bonus } = req.body;
 
-  if (typeof bonus !== "number") {
-    return res.status(400).json({ error: "Invalid bonus value." });
-  }
+  if (typeof bonus !== "number") return res.status(400).json({ error: "Bonus must be a number." });
 
-  try {
-    const { data: updatedUser, error: updateError } = await supabase
-      .from("users")
-      .update({ bonus })
-      .eq("id", id)
-      .select("id, username, email, balance, bonus")
-      .single();
+  const { data, error } = await supabase
+    .from("users")
+    .update({ bonus })
+    .eq("id", id)
+    .select()
+    .single();
 
-    if (updateError) {
-      console.error("Error updating user bonus:", updateError);
-      return res.status(500).json({ error: "Failed to update user bonus." });
-    }
+  if (error) return res.status(500).json({ error: "Failed to update bonus." });
 
-    if (!updatedUser) {
-      return res.status(404).json({ error: "User not found." });
-    }
-
-    res.json({ message: "User bonus updated successfully!", user: updatedUser });
-  } catch (error) {
-    console.error("Error updating user bonus:", error);
-    res.status(500).json({ error: "Internal server error during bonus update." });
-  }
+  res.json({ message: "Bonus updated", user: data });
 });
 
 const PORT = process.env.PORT || 5000;
