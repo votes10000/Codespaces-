@@ -60,7 +60,7 @@ app.post(
         .or(`username.eq.${username},email.eq.${email}`)
         .single();
 
-      if (checkError) {
+      if (checkError && checkError.code !== "PGRST116") {
         console.error("Error checking existing user:", checkError);
         return res.status(500).json({ error: "Internal server error." });
       }
@@ -92,38 +92,66 @@ app.post(
   }
 );
 
-// Client Login
-app.post("/login", async (req, res) => {
-  const { identifier, password } = req.body; // Can be username or email
-
-  try {
-    const { data: user, error: userError } = await supabase
-      .from("users")
-      .select("id, username, email, password_hash, is_admin")
-      .or(`username.eq.${identifier},email.eq.${identifier}`)
-      .single();
-
-    if (userError) {
-      console.error("Error during login:", userError);
-      return res.status(500).json({ error: "Internal server error." });
+// Updated Login Route with Validation
+app.post(
+  "/login",
+  [
+    body("identifier")
+      .notEmpty()
+      .withMessage("Username or email is required.")
+      .isLength({ min: 3 })
+      .withMessage("Identifier must be at least 3 characters."),
+    body("password")
+      .notEmpty()
+      .withMessage("Password is required.")
+      .isLength({ min: 6 })
+      .withMessage("Password must be at least 6 characters."),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
 
-    if (!user) {
-      return res.status(401).json({ error: "Invalid credentials." });
-    }
+    const { identifier, password } = req.body;
 
-    const passwordMatch = await bcrypt.compare(password, user.password_hash);
-    if (!passwordMatch) {
-      return res.status(401).json({ error: "Invalid credentials." });
-    }
+    try {
+      const { data: user, error: userError } = await supabase
+        .from("users")
+        .select("id, username, email, password_hash, is_admin")
+        .or(`username.eq.${identifier},email.eq.${identifier}`)
+        .single();
 
-    const token = generateToken(user.id, user.is_admin);
-    res.json({ message: "Login successful!", token, user: { id: user.id, username: user.username, email: user.email } });
-  } catch (error) {
-    console.error("Login error:", error);
-    res.status(500).json({ error: "Internal server error during login." });
+      if (userError) {
+        console.error("Error during login:", userError);
+        return res.status(500).json({ error: "Internal server error." });
+      }
+
+      if (!user) {
+        return res.status(401).json({ error: "Invalid credentials." });
+      }
+
+      const passwordMatch = await bcrypt.compare(password, user.password_hash);
+      if (!passwordMatch) {
+        return res.status(401).json({ error: "Invalid credentials." });
+      }
+
+      const token = generateToken(user.id, user.is_admin || false);
+      res.json({
+        message: "Login successful!",
+        token,
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+        },
+      });
+    } catch (error) {
+      console.error("Login error:", error);
+      res.status(500).json({ error: "Internal server error during login." });
+    }
   }
-});
+);
 
 // Admin-only route to update user balance
 app.put("/admin/users/:id/balance", verifyToken, async (req, res) => {
@@ -134,7 +162,7 @@ app.put("/admin/users/:id/balance", verifyToken, async (req, res) => {
   const { id } = req.params;
   const { balance } = req.body;
 
-  if (typeof balance !== 'number') {
+  if (typeof balance !== "number") {
     return res.status(400).json({ error: "Invalid balance value." });
   }
 
@@ -171,7 +199,7 @@ app.put("/admin/users/:id/bonus", verifyToken, async (req, res) => {
   const { id } = req.params;
   const { bonus } = req.body;
 
-  if (typeof bonus !== 'number') {
+  if (typeof bonus !== "number") {
     return res.status(400).json({ error: "Invalid bonus value." });
   }
 
